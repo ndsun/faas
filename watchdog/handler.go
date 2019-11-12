@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	limiter "github.com/openfaas/faas-middleware/concurrency-limiter"
+
 	"github.com/openfaas/faas/watchdog/types"
 )
 
@@ -92,6 +94,9 @@ func pipeRequest(config *WatchdogConfig, w http.ResponseWriter, r *http.Request,
 	var buildInputErr error
 	requestBody, buildInputErr = buildFunctionInput(config, r)
 	if buildInputErr != nil {
+		if config.writeDebug == true {
+			log.Printf("Error=%s, ReadLen=%d\n", buildInputErr.Error(), len(requestBody))
+		}
 		ri.headerWritten = true
 		w.WriteHeader(http.StatusBadRequest)
 		// I.e. "exit code 1"
@@ -228,7 +233,9 @@ func getAdditionalEnvs(config *WatchdogConfig, r *http.Request, method string) [
 		}
 
 		envs = append(envs, fmt.Sprintf("Http_Method=%s", method))
+		// Deprecation notice: Http_ContentLength will be deprecated
 		envs = append(envs, fmt.Sprintf("Http_ContentLength=%d", r.ContentLength))
+		envs = append(envs, fmt.Sprintf("Http_Content_Length=%d", r.ContentLength))
 
 		if config.writeDebug {
 			log.Println("Query ", r.URL.RawQuery)
@@ -292,8 +299,8 @@ func makeHealthHandler() func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-func makeRequestHandler(config *WatchdogConfig) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
+func makeRequestHandler(config *WatchdogConfig) http.HandlerFunc {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case
 			http.MethodPost,
@@ -307,5 +314,6 @@ func makeRequestHandler(config *WatchdogConfig) func(http.ResponseWriter, *http.
 			w.WriteHeader(http.StatusMethodNotAllowed)
 
 		}
-	}
+	})
+	return limiter.NewConcurrencyLimiter(handler, config.maxInflight).ServeHTTP
 }

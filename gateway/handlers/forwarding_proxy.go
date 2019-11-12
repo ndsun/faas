@@ -39,7 +39,11 @@ type URLPathTransformer interface {
 }
 
 // MakeForwardingProxyHandler create a handler which forwards HTTP requests
-func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy, notifiers []HTTPNotifier, baseURLResolver BaseURLResolver, urlPathTransformer URLPathTransformer) http.HandlerFunc {
+func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy,
+	notifiers []HTTPNotifier,
+	baseURLResolver BaseURLResolver,
+	urlPathTransformer URLPathTransformer,
+	serviceAuthInjector AuthInjector) http.HandlerFunc {
 
 	writeRequestURI := false
 	if _, exists := os.LookupEnv("write_request_uri"); exists {
@@ -54,19 +58,16 @@ func MakeForwardingProxyHandler(proxy *types.HTTPClientReverseProxy, notifiers [
 
 		start := time.Now()
 
-		statusCode, err := forwardRequest(w, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI)
+		statusCode, err := forwardRequest(w, r, proxy.Client, baseURL, requestURL, proxy.Timeout, writeRequestURI, serviceAuthInjector)
 
 		seconds := time.Since(start)
 		if err != nil {
 			log.Printf("error with upstream request to: %s, %s\n", requestURL, err.Error())
 		}
 
-		// defer func() {
 		for _, notifier := range notifiers {
 			notifier.Notify(r.Method, requestURL, originalURL, statusCode, seconds)
 		}
-		// }()
-
 	}
 }
 
@@ -80,10 +81,12 @@ func buildUpstreamRequest(r *http.Request, baseURL string, requestURL string) *h
 	upstreamReq, _ := http.NewRequest(r.Method, url, nil)
 
 	copyHeaders(upstreamReq.Header, &r.Header)
+	deleteHeaders(&upstreamReq.Header, &hopHeaders)
 
 	if len(r.Host) > 0 && upstreamReq.Header.Get("X-Forwarded-Host") == "" {
 		upstreamReq.Header["X-Forwarded-Host"] = []string{r.Host}
 	}
+
 	if upstreamReq.Header.Get("X-Forwarded-For") == "" {
 		upstreamReq.Header["X-Forwarded-For"] = []string{r.RemoteAddr}
 	}
@@ -95,11 +98,22 @@ func buildUpstreamRequest(r *http.Request, baseURL string, requestURL string) *h
 	return upstreamReq
 }
 
-func forwardRequest(w http.ResponseWriter, r *http.Request, proxyClient *http.Client, baseURL string, requestURL string, timeout time.Duration, writeRequestURI bool) (int, error) {
+func forwardRequest(w http.ResponseWriter,
+	r *http.Request,
+	proxyClient *http.Client,
+	baseURL string,
+	requestURL string,
+	timeout time.Duration,
+	writeRequestURI bool,
+	serviceAuthInjector AuthInjector) (int, error) {
 
 	upstreamReq := buildUpstreamRequest(r, baseURL, requestURL)
 	if upstreamReq.Body != nil {
 		defer upstreamReq.Body.Close()
+	}
+
+	if serviceAuthInjector != nil {
+		serviceAuthInjector.Inject(upstreamReq)
 	}
 
 	if writeRequestURI {
@@ -141,6 +155,12 @@ func copyHeaders(destination http.Header, source *http.Header) {
 	}
 }
 
+func deleteHeaders(target *http.Header, exclude *[]string) {
+	for _, h := range *exclude {
+		target.Del(h)
+	}
+}
+
 // SingleHostBaseURLResolver resolves URLs against a single BaseURL
 type SingleHostBaseURLResolver struct {
 	BaseURL string
@@ -159,7 +179,8 @@ func (s SingleHostBaseURLResolver) Resolve(r *http.Request) string {
 
 // FunctionAsHostBaseURLResolver resolves URLs using a function from the URL as a host
 type FunctionAsHostBaseURLResolver struct {
-	FunctionSuffix string
+	FunctionSuffix    string
+	FunctionNamespace string
 }
 
 // Resolve the base URL for a request
@@ -168,8 +189,13 @@ func (f FunctionAsHostBaseURLResolver) Resolve(r *http.Request) string {
 
 	const watchdogPort = 8080
 	var suffix string
+
 	if len(f.FunctionSuffix) > 0 {
-		suffix = "." + f.FunctionSuffix
+		if index := strings.LastIndex(svcName, "."); index > -1 && len(svcName) > index+1 {
+			suffix = strings.Replace(f.FunctionSuffix, f.FunctionNamespace, "", -1)
+		} else {
+			suffix = "." + f.FunctionSuffix
+		}
 	}
 
 	return fmt.Sprintf("http://%s%s:%d", svcName, suffix, watchdogPort)
@@ -207,4 +233,22 @@ func (f FunctionPrefixTrimmingURLPathTransformer) Transform(r *http.Request) str
 	}
 
 	return ret
+}
+
+// Hop-by-hop headers. These are removed when sent to the backend.
+// As of RFC 7230, hop-by-hop headers are required to appear in the
+// Connection header field. These are the headers defined by the
+// obsoleted RFC 2616 (section 13.5.1) and are used for backward
+// compatibility.
+// Copied from: https://golang.org/src/net/http/httputil/reverseproxy.go
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection", // non-standard but still sent by libcurl and rejected by e.g. google
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",      // canonicalized version of "TE"
+	"Trailer", // not Trailers per URL above; https://www.rfc-editor.org/errata_search.php?eid=4522
+	"Transfer-Encoding",
+	"Upgrade",
 }

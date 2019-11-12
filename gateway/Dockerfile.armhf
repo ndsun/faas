@@ -3,9 +3,9 @@ ARG GIT_COMMIT_SHA
 ARG GIT_COMMIT_MESSAGE
 ARG VERSION='dev'
 
-RUN curl -sSfL https://github.com/alexellis/license-check/releases/download/0.2.3/license-check-armhf \
-    > /usr/bin/license-check \
-    && chmod +x /usr/bin/license-check
+RUN curl -sLSf \
+  https://raw.githubusercontent.com/teamserverless/license-check/master/get.sh | sh \
+  && mv ./license-check /usr/bin/
 
 WORKDIR /go/src/github.com/openfaas/faas/gateway
 
@@ -33,7 +33,7 @@ RUN license-check -path ./ --verbose=false "Alex Ellis" "OpenFaaS Project" "Open
     -X github.com/openfaas/faas/gateway/version.Version=${VERSION}" \
     -a -installsuffix cgo -o gateway .
 
-FROM alpine:3.8
+FROM alpine:3.10
 
 LABEL org.label-schema.license="MIT" \
     org.label-schema.vcs-url="https://github.com/openfaas/faas" \
@@ -43,18 +43,20 @@ LABEL org.label-schema.license="MIT" \
     org.label-schema.docker.schema-version="1.0"
 
 RUN addgroup -S app \
-    && adduser -S -g app app
+    && adduser -S -g app app \
+    && apk add --no-cache ca-certificates
 
 WORKDIR /home/app
 
 EXPOSE 8080
+EXPOSE 8082
 ENV http_proxy      ""
 ENV https_proxy     ""
 
 COPY --from=build /go/src/github.com/openfaas/faas/gateway/gateway    .
 
 COPY assets     assets
-RUN sed -ie s/store.json/store-armhf.json/g /home/app/assets/script/funcstore.js
+RUN sed -ie s/x86_64/armhf/g /home/app/assets/script/funcstore.js
 RUN chown -R app:app ./
 USER app
 
